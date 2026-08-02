@@ -960,6 +960,14 @@ class _CodexCompletionsAdapter:
         self._model = model
 
     def create(self, **kwargs) -> Any:
+        if kwargs.get("stream"):
+            stream_kwargs = dict(kwargs)
+            stream_kwargs["stream"] = False
+            return self._create_incremental_stream(**stream_kwargs)
+
+        stream_delta_sink = kwargs.pop("_hermes_stream_delta_sink", None)
+        stream_interrupt_check = kwargs.pop("_hermes_stream_interrupt_check", None)
+        stream_resource_sink = kwargs.pop("_hermes_stream_resource_sink", None)
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
 
@@ -1164,6 +1172,8 @@ class _CodexCompletionsAdapter:
                 logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
 
         def _check_cancelled() -> None:
+            if callable(stream_interrupt_check) and stream_interrupt_check():
+                raise InterruptedError("Codex auxiliary stream consumer closed")
             if deadline is not None and time.monotonic() >= deadline:
                 if not timed_out.is_set():
                     _close_client_on_timeout()
@@ -1215,19 +1225,26 @@ class _CodexCompletionsAdapter:
                 _check_cancelled()
 
             event_stream = self._client.responses.create(**stream_kwargs)
+            if callable(stream_resource_sink):
+                stream_resource_sink(event_stream)
             try:
                 final = _consume_codex_event_stream(
                     event_stream,
                     model=resp_kwargs.get("model"),
+                    on_text_delta=stream_delta_sink,
                     on_event=_on_each_event,
                 )
             finally:
-                close_fn = getattr(event_stream, "close", None)
-                if callable(close_fn):
-                    try:
-                        close_fn()
-                    except Exception:
-                        pass
+                try:
+                    close_fn = getattr(event_stream, "close", None)
+                    if callable(close_fn):
+                        try:
+                            close_fn()
+                        except Exception:
+                            pass
+                finally:
+                    if callable(stream_resource_sink):
+                        stream_resource_sink(None)
 
             if final is None:
                 raise RuntimeError("Codex auxiliary Responses stream did not return a final response")
@@ -1295,6 +1312,180 @@ class _CodexCompletionsAdapter:
             model=model,
             usage=usage,
         )
+
+    def _create_incremental_stream(self, **kwargs) -> Any:
+        """Bridge callback-based Responses events to ChatCompletion chunks."""
+        import queue
+
+        output_queue: "queue.Queue[Any]" = queue.Queue()
+        sentinel = object()
+        consumer_closed = threading.Event()
+        call_id = f"chatcmpl-{uuid.uuid4().hex}"
+        model = kwargs.get("model", self._model)
+
+        def _chunk(*, content=None, tool_calls=None, finish_reason=None, usage=None):
+            return SimpleNamespace(
+                id=call_id,
+                object="chat.completion.chunk",
+                created=int(time.time()),
+                model=model,
+                choices=[SimpleNamespace(
+                    index=0,
+                    delta=SimpleNamespace(
+                        role="assistant",
+                        content=content,
+                        tool_calls=tool_calls,
+                    ),
+                    finish_reason=finish_reason,
+                )],
+                usage=usage,
+            )
+
+        def _producer(owner: Any) -> None:
+            emitted_text = False
+
+            def _emit_delta(text: str) -> None:
+                nonlocal emitted_text
+                if not text or consumer_closed.is_set():
+                    return
+                emitted_text = True
+                output_queue.put(_chunk(content=text))
+
+            try:
+                response = self.create(
+                    **kwargs,
+                    _hermes_stream_delta_sink=_emit_delta,
+                    _hermes_stream_interrupt_check=consumer_closed.is_set,
+                    _hermes_stream_resource_sink=owner._publish_provider_resource,
+                )
+                if consumer_closed.is_set():
+                    return
+                choice = (getattr(response, "choices", None) or [None])[0]
+                message = getattr(choice, "message", None)
+                tool_calls = getattr(message, "tool_calls", None) or []
+                if tool_calls:
+                    tool_deltas = []
+                    for index, tool_call in enumerate(tool_calls):
+                        function = getattr(tool_call, "function", None)
+                        tool_deltas.append(SimpleNamespace(
+                            index=index,
+                            id=getattr(tool_call, "id", None),
+                            type=getattr(tool_call, "type", "function"),
+                            function=SimpleNamespace(
+                                name=getattr(function, "name", None),
+                                arguments=getattr(function, "arguments", None),
+                            ),
+                        ))
+                    output_queue.put(_chunk(
+                        tool_calls=tool_deltas,
+                        finish_reason="tool_calls",
+                        usage=getattr(response, "usage", None),
+                    ))
+                else:
+                    complete_content = getattr(message, "content", None)
+                    if complete_content and not emitted_text:
+                        output_queue.put(_chunk(content=complete_content))
+                    output_queue.put(_chunk(
+                        finish_reason=getattr(choice, "finish_reason", None) or "stop",
+                        usage=getattr(response, "usage", None),
+                    ))
+            except Exception as exc:
+                output_queue.put(exc)
+            finally:
+                output_queue.put(sentinel)
+
+        producer_context = contextvars.copy_context()
+
+        class _IncrementalStreamIterator:
+            """Close-aware lazy iterator owning the producer lifecycle.
+
+            A generator's ``finally`` does not run when ``close()`` is called
+            before its first iteration. Starting lazily means that case opens
+            no provider stream at all, while explicit close still interrupts
+            an already-running producer through ``consumer_closed``.
+            """
+
+            def __init__(self) -> None:
+                self._lock = threading.Lock()
+                self._producer: Optional[threading.Thread] = None
+                self._provider_resource: Any = None
+                self._closed = False
+
+            def __iter__(self):
+                return self
+
+            def _ensure_started(self) -> bool:
+                with self._lock:
+                    if self._closed:
+                        return False
+                    if self._producer is None:
+                        self._producer = threading.Thread(
+                            target=lambda: producer_context.run(_producer, self),
+                            name="codex-aux-stream",
+                            daemon=True,
+                        )
+                        self._producer.start()
+                    return True
+
+            def __next__(self):
+                if not self._ensure_started():
+                    raise StopIteration
+                item = output_queue.get()
+                with self._lock:
+                    if self._closed:
+                        raise StopIteration
+                if item is sentinel:
+                    self.close()
+                    raise StopIteration
+                if isinstance(item, Exception):
+                    self.close()
+                    raise item
+                return item
+
+            @staticmethod
+            def _close_provider_resource(resource: Any) -> None:
+                close = getattr(resource, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        logger.debug(
+                            "Codex auxiliary: provider stream close failed",
+                            exc_info=True,
+                        )
+
+            def _publish_provider_resource(self, resource: Any) -> None:
+                close_immediately = None
+                with self._lock:
+                    if resource is None:
+                        self._provider_resource = None
+                    elif self._closed:
+                        close_immediately = resource
+                    else:
+                        self._provider_resource = resource
+                if close_immediately is not None:
+                    self._close_provider_resource(close_immediately)
+
+            def close(self) -> None:
+                provider_resource = None
+                with self._lock:
+                    if self._closed:
+                        return
+                    self._closed = True
+                    consumer_closed.set()
+                    provider_resource = self._provider_resource
+                    self._provider_resource = None
+                    output_queue.put(sentinel)
+                if provider_resource is not None:
+                    self._close_provider_resource(provider_resource)
+
+            def __del__(self) -> None:
+                try:
+                    self.close()
+                except Exception:
+                    pass
+
+        return _IncrementalStreamIterator()
 
 
 class _CodexChatShim:
@@ -2641,15 +2832,70 @@ def _relay_sync_stream(
     provider: str | None = None,
     api_mode: str | None = None,
 ) -> Any:
+    def _field(value: Any, name: str, default: Any = None) -> Any:
+        if isinstance(value, dict):
+            return value.get(name, default)
+        return getattr(value, name, default)
+
+    def _open_stream(request: dict[str, Any]) -> Any:
+        raw = client.chat.completions.create(**request)
+        choices = _field(raw, "choices")
+        if not choices:
+            return raw
+
+        # Some adapters (notably openai-codex) consume Responses SSE events
+        # inside ``create`` and return a complete ChatCompletion even though
+        # the caller requested ``stream=True``. Convert that terminal response
+        # into one standards-shaped chunk so nested Relay/MoA consumers never
+        # attempt ``iter(SimpleNamespace)`` and the final answer still reaches
+        # the outer stream accumulator.
+        choice = choices[0]
+        message = _field(choice, "message")
+        complete_tool_calls = _field(message, "tool_calls")
+        tool_call_deltas = None
+        if complete_tool_calls:
+            tool_call_deltas = []
+            for index, tool_call in enumerate(complete_tool_calls):
+                function = _field(tool_call, "function")
+                tool_call_deltas.append(SimpleNamespace(
+                    index=_field(tool_call, "index", index),
+                    id=_field(tool_call, "id"),
+                    type=_field(tool_call, "type", "function"),
+                    function=SimpleNamespace(
+                        name=_field(function, "name"),
+                        arguments=_field(function, "arguments", ""),
+                    ),
+                ))
+        delta = SimpleNamespace(
+            role=_field(message, "role", "assistant"),
+            content=_field(message, "content"),
+            tool_calls=tool_call_deltas,
+            reasoning=_field(message, "reasoning"),
+            reasoning_content=_field(message, "reasoning_content"),
+        )
+        chunk = SimpleNamespace(
+            id=_field(raw, "id", ""),
+            object="chat.completion.chunk",
+            created=_field(raw, "created", 0),
+            model=_field(raw, "model", str(request.get("model") or "")),
+            choices=[SimpleNamespace(
+                index=_field(choice, "index", 0),
+                delta=delta,
+                finish_reason=_field(choice, "finish_reason"),
+            )],
+            usage=_field(raw, "usage"),
+        )
+        return iter((chunk,))
+
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
-        return client.chat.completions.create(**kwargs)
+        return _open_stream(kwargs)
     provider_name, fallback_model, metadata = route
     from agent import relay_llm
 
     return relay_llm.stream_current(
         kwargs,
-        lambda request: client.chat.completions.create(**request),
+        _open_stream,
         name=provider_name,
         model_name=str(kwargs.get("model") or fallback_model),
         finalizer=dict,

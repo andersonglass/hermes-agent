@@ -96,6 +96,51 @@ def test_auxiliary_retries_share_logical_relay_identity(monkeypatch):
     ]
 
 
+def test_complete_response_stream_adapter_runs_through_active_relay(relay_turn):
+    _relay, turn = relay_turn
+    complete = SimpleNamespace(
+        id="complete-1",
+        created=1,
+        model="test-model",
+        usage=None,
+        choices=[SimpleNamespace(
+            index=0,
+            finish_reason="tool_calls",
+            message=SimpleNamespace(
+                role="assistant",
+                content=None,
+                tool_calls=[SimpleNamespace(
+                    id="call-1",
+                    type="function",
+                    function=SimpleNamespace(name="lookup", arguments="{}"),
+                )],
+            ),
+        )],
+    )
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **_kwargs: complete)
+        )
+    )
+
+    @auxiliary_client._relay_auxiliary_call
+    def run(task):
+        auxiliary_client._set_relay_auxiliary_route(
+            "openai-codex",
+            "test-model",
+            "chat_completions",
+        )
+        return list(auxiliary_client._relay_sync_stream(
+            client,
+            {"model": "test-model", "messages": [], "stream": True},
+        ))
+
+    chunks = run("moa_aggregation")
+
+    assert chunks[0].choices[0].delta.tool_calls[0].index == 0
+    assert turn.logical_llm_calls == {}
+
+
 @pytest.mark.asyncio
 async def test_async_auxiliary_attempt_uses_inherited_relay_adapter(monkeypatch):
     captured = {}

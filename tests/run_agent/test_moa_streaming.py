@@ -5,6 +5,7 @@ and then returning the aggregator's raw streaming iterator (from call_llm), so
 the acting model's output can stream to the user. stream=False is the original
 complete-response path and must stay byte-identical.
 """
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -219,3 +220,295 @@ def test_call_llm_non_stream_still_validates(monkeypatch):
         messages=[{"role": "user", "content": "hi"}],
     )
     assert validated["called"] is True
+
+
+def test_relay_stream_adapts_complete_response_from_internal_streaming_client(monkeypatch):
+    """Adapters such as openai-codex consume their wire stream internally and
+    return a complete ChatCompletion even when ``stream=True`` was requested.
+    The MoA relay seam must expose that completion as a valid chunk iterator
+    instead of attempting ``iter(SimpleNamespace)``.
+    """
+    from agent import auxiliary_client as ac
+
+    complete = _response("streamed through adapter")
+
+    class _Completions:
+        def create(self, **_kwargs):
+            return complete
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
+    monkeypatch.setattr(ac, "_relay_auxiliary_metadata", lambda **_kwargs: None)
+
+    chunks = list(ac._relay_sync_stream(client, {"model": "fake", "stream": True}))
+
+    assert len(chunks) == 1
+    assert chunks[0].choices[0].delta.content == "streamed through adapter"
+    assert chunks[0].choices[0].finish_reason == "stop"
+
+
+def test_relay_stream_adds_indices_when_adapting_complete_tool_calls(monkeypatch):
+    from agent import auxiliary_client as ac
+
+    complete = SimpleNamespace(
+        id="complete-1",
+        created=1,
+        model="fake",
+        usage=None,
+        choices=[SimpleNamespace(
+            index=0,
+            finish_reason="tool_calls",
+            message=SimpleNamespace(
+                role="assistant",
+                content=None,
+                reasoning=None,
+                reasoning_content=None,
+                tool_calls=[SimpleNamespace(
+                    id="call-1",
+                    type="function",
+                    function=SimpleNamespace(name="lookup", arguments='{"job":"42"}'),
+                )],
+            ),
+        )],
+    )
+
+    class _Completions:
+        def create(self, **_kwargs):
+            return complete
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
+    monkeypatch.setattr(ac, "_relay_auxiliary_metadata", lambda **_kwargs: None)
+
+    chunk = list(ac._relay_sync_stream(client, {"model": "fake", "stream": True}))[0]
+    tool_delta = chunk.choices[0].delta.tool_calls[0]
+
+    assert tool_delta.index == 0
+    assert tool_delta.id == "call-1"
+    assert tool_delta.type == "function"
+    assert tool_delta.function.name == "lookup"
+    assert tool_delta.function.arguments == '{"job":"42"}'
+
+
+def test_codex_auxiliary_adapter_emits_incremental_text_chunks():
+    from agent.auxiliary_client import _CodexCompletionsAdapter
+
+    events = [
+        SimpleNamespace(
+            type="response.output_item.added",
+            item=SimpleNamespace(type="message", phase="final"),
+        ),
+        SimpleNamespace(type="response.output_text.delta", delta="Hel"),
+        SimpleNamespace(type="response.output_text.delta", delta="lo"),
+        SimpleNamespace(
+            type="response.output_item.done",
+            item=SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(type="output_text", text="Hello")],
+            ),
+        ),
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(
+                id="resp-1",
+                status="completed",
+                usage=SimpleNamespace(input_tokens=2, output_tokens=2, total_tokens=4),
+            ),
+        ),
+    ]
+    captured = {}
+
+    def create_response(**kwargs):
+        captured.update(kwargs)
+        return iter(events)
+
+    real_client = SimpleNamespace(
+        base_url="https://chatgpt.com/backend-api/codex",
+        responses=SimpleNamespace(create=create_response),
+    )
+    adapter = _CodexCompletionsAdapter(real_client, "gpt-test")
+
+    chunks = list(adapter.create(
+        messages=[{"role": "user", "content": "hello"}],
+        model="gpt-test",
+        stream=True,
+    ))
+
+    assert captured["stream"] is True
+    assert [
+        chunk.choices[0].delta.content
+        for chunk in chunks
+        if chunk.choices[0].delta.content
+    ] == ["Hel", "lo"]
+    assert chunks[-1].choices[0].finish_reason == "stop"
+    assert chunks[-1].usage.total_tokens == 4
+
+
+def test_codex_auxiliary_adapter_streams_indexed_tool_calls():
+    from agent.auxiliary_client import _CodexCompletionsAdapter
+
+    function_call = SimpleNamespace(
+        type="function_call",
+        call_id="call-1",
+        name="lookup",
+        arguments='{"id":42}',
+    )
+    events = [
+        SimpleNamespace(type="response.output_item.added", item=function_call),
+        SimpleNamespace(type="response.output_item.done", item=function_call),
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(id="resp-2", status="completed", usage=None),
+        ),
+    ]
+    real_client = SimpleNamespace(
+        base_url="https://chatgpt.com/backend-api/codex",
+        responses=SimpleNamespace(create=lambda **_: iter(events)),
+    )
+    adapter = _CodexCompletionsAdapter(real_client, "gpt-test")
+
+    chunks = list(adapter.create(
+        messages=[{"role": "user", "content": "use a tool"}],
+        model="gpt-test",
+        stream=True,
+    ))
+
+    terminal = chunks[-1]
+    assert terminal.choices[0].finish_reason == "tool_calls"
+    tool_delta = terminal.choices[0].delta.tool_calls[0]
+    assert tool_delta.index == 0
+    assert tool_delta.id == "call-1"
+    assert tool_delta.function.name == "lookup"
+
+
+def test_codex_auxiliary_adapter_close_before_iteration_never_starts_provider():
+    from agent.auxiliary_client import _CodexCompletionsAdapter
+
+    provider_calls = []
+
+    def create_response(**kwargs):
+        provider_calls.append(kwargs)
+        return iter(())
+
+    real_client = SimpleNamespace(
+        base_url="https://chatgpt.com/backend-api/codex",
+        responses=SimpleNamespace(create=create_response),
+    )
+    adapter = _CodexCompletionsAdapter(real_client, "gpt-test")
+
+    stream = adapter.create(
+        messages=[{"role": "user", "content": "hello"}],
+        model="gpt-test",
+        stream=True,
+    )
+    stream.close()
+
+    assert provider_calls == []
+    assert list(stream) == []
+
+
+def test_codex_auxiliary_adapter_close_unblocks_provider_publication_race():
+    from agent.auxiliary_client import _CodexCompletionsAdapter
+
+    create_entered = threading.Event()
+    allow_provider_publication = threading.Event()
+
+    class BlockingEventStream:
+        def __init__(self):
+            self.close_called = threading.Event()
+            self.released = threading.Event()
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.released.wait(timeout=5)
+            raise StopIteration
+
+        def close(self):
+            self.close_called.set()
+            self.released.set()
+
+    provider_stream = BlockingEventStream()
+
+    def create_response(**_kwargs):
+        create_entered.set()
+        allow_provider_publication.wait(timeout=5)
+        return provider_stream
+
+    real_client = SimpleNamespace(
+        base_url="https://chatgpt.com/backend-api/codex",
+        responses=SimpleNamespace(create=create_response),
+    )
+    adapter = _CodexCompletionsAdapter(real_client, "gpt-test")
+    stream = adapter.create(
+        messages=[{"role": "user", "content": "hello"}],
+        model="gpt-test",
+        stream=True,
+    )
+
+    consumer = threading.Thread(target=lambda: next(stream, None))
+    consumer.start()
+    assert create_entered.wait(timeout=1)
+    producer = stream._producer
+
+    stream.close()
+    allow_provider_publication.set()
+    provider_was_closed = provider_stream.close_called.wait(timeout=1)
+    producer.join(timeout=1)
+    consumer.join(timeout=1)
+    producer_stopped = not producer.is_alive()
+    consumer_stopped = not consumer.is_alive()
+
+    # Always release a broken implementation so this regression test cannot
+    # strand a daemon producer after its expected RED failure.
+    provider_stream.released.set()
+    producer.join(timeout=1)
+    consumer.join(timeout=1)
+
+    assert provider_was_closed
+    assert producer_stopped
+    assert consumer_stopped
+
+
+def test_codex_auxiliary_adapter_close_interrupts_started_provider_stream():
+    from agent.auxiliary_client import _CodexCompletionsAdapter
+
+    class BlockingEventStream:
+        def __init__(self):
+            self.event_index = 0
+            self.close_called = threading.Event()
+            self.released = threading.Event()
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.event_index == 0:
+                self.event_index += 1
+                return SimpleNamespace(type="response.output_text.delta", delta="first")
+            self.released.wait(timeout=5)
+            raise StopIteration
+
+        def close(self):
+            self.close_called.set()
+            self.released.set()
+
+    provider_stream = BlockingEventStream()
+    real_client = SimpleNamespace(
+        base_url="https://chatgpt.com/backend-api/codex",
+        responses=SimpleNamespace(create=lambda **_: provider_stream),
+    )
+    adapter = _CodexCompletionsAdapter(real_client, "gpt-test")
+    stream = adapter.create(
+        messages=[{"role": "user", "content": "hello"}],
+        model="gpt-test",
+        stream=True,
+    )
+
+    assert next(stream).choices[0].delta.content == "first"
+    producer = stream._producer
+    stream.close()
+
+    assert provider_stream.close_called.wait(timeout=1)
+    producer.join(timeout=1)
+    assert not producer.is_alive()
+    assert list(stream) == []
